@@ -11,6 +11,8 @@ namespace ModBusV2
     {
         bool isCancellationRequested = false;
 
+        ModBusCollector collector = new();
+
         public void Start()
         {
             while (!isCancellationRequested)

@@ -12,13 +12,15 @@ namespace ModBusV2
         private CancellationTokenSource cancellationTokenSource;
 
         // Список активных клиентов + их стримы 
-        private ConcurrentDictionary<TcpClient, Stream> _clients = new();
+        private ConcurrentDictionary<TcpClient, NetworkStream> _clients = new();
 
         // Кешированные данные регистров
         private ConcurrentDictionary<IPAddress, ushort[]> _deviceRegisters = new();
 
         // Актуальные для принятия транзакции
         private ConcurrentDictionary<ushort, bool> _activeTransactions = new();
+
+        private List<Task> _tasks = new List<Task>();
 
         // ID текущей транзакции
         private ushort _transactionID = 0;
@@ -45,8 +47,12 @@ namespace ModBusV2
 
             cancellationTokenSource = new CancellationTokenSource();
 
-            Task.Run(() => SendReadRequestLoop(cancellationTokenSource.Token));
-            //Task.Run(() => ReadResponceLoop(cancellationTokenSource.Token));
+            _tasks.Add(Task.Run(() => SendReadRequestLoop(cancellationTokenSource.Token)));
+            foreach (var device in _clients)
+            {
+                _tasks.Add(Task.Run(()
+                    => ReadResponceLoop(device.Value, cancellationTokenSource.Token)));
+            }
             _work = true;
         }
 
@@ -60,6 +66,8 @@ namespace ModBusV2
             cancellationTokenSource.Cancel();
             cancellationTokenSource.Dispose();
             _work = false;
+
+            Task.WaitAll(_tasks);
         }
 
         public bool TrySendWriteRequest(CancellationToken cancellationToken = default)
@@ -109,7 +117,9 @@ namespace ModBusV2
             }
         }
 
-        private async Task ReadResponceLoop(NetworkStream stream, CancellationToken cancellationToken = default)
+        private async Task ReadResponceLoop(
+            NetworkStream stream, 
+            CancellationToken cancellationToken = default)
         {
             EndPoint? endpoint = stream.Socket.RemoteEndPoint;
             IPAddress address;
@@ -119,6 +129,7 @@ namespace ModBusV2
             else throw new NoIPExeption();
 
             byte[] buffer = new byte[512];
+            ushort[] registersArray;
             using MemoryStream message = new();
 
             Span<ushort> registers = new();
@@ -137,7 +148,9 @@ namespace ModBusV2
             while (!cancellationToken.IsCancellationRequested)
             {
 
-                bufferBytesRead = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken);
+                bufferBytesRead = await stream
+                    .ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                    .ConfigureAwait(false);
 
                 registers = new();
                 registersBigEndian = new();
@@ -146,12 +159,15 @@ namespace ModBusV2
 
                 if (bufferBytesRead == 0)
                 {
-                    // TODO Сделать разрыв соедениения
+                    Clear();
+                    return;
                 }
 
                 pointer = 0;
 
-                while (pointer < bufferBytesRead && bufferBytesRead > 0 && !cancellationToken.IsCancellationRequested)
+                while (pointer < bufferBytesRead 
+                    && bufferBytesRead > 0 
+                    && !cancellationToken.IsCancellationRequested)
                 {
 
                     // Если MBAP ещё не прочитан
@@ -229,7 +245,7 @@ namespace ModBusV2
 
                     //Проверяю что мы этот запрос отправляли
                     if (!_activeTransactions.ContainsKey(localTransactionID)
-                        || _activeTransactions[localTransactionID])
+                        || !_activeTransactions[localTransactionID])
                     {
                         Clear();
                         continue;
@@ -242,9 +258,16 @@ namespace ModBusV2
                     switch (PDU[0])
                     {
                         case 3:
-                            if (PDU.Length >= 3 && PDU.Length % 2 == 0)
+                            if (PDU[1] == PDU.Length - 2 
+                                && PDU[1] % 2 == 0 
+                                && PDU[1] <= 2 * _deviceRegisters[address].Length)
                             {
-                                registers = _deviceRegisters[address].AsSpan();
+                                registersArray = _deviceRegisters.GetOrAdd(
+                                    address,
+                                    static (_, size) => new ushort[size],
+                                    10
+                                );
+                                registers = registersArray.AsSpan();
                                 registersBigEndian = MemoryMarshal.Cast<byte, ushort>(PDU.Slice(2));
                                 BinaryPrimitives.ReverseEndianness(registersBigEndian, registers);
                             }
@@ -289,7 +312,7 @@ namespace ModBusV2
             for (int i = 0; i < 16; i++)
             {
 
-                tcpClientsTasks = new Task<Tcp?>[16];
+                tcpClientsTasks = new Task[16];
 
                 for (int j = 0; j < 16; j++)
                 {
@@ -339,6 +362,12 @@ namespace ModBusV2
                     var endPoint = tcpClient.Client.RemoteEndPoint;
                     if (endPoint is IPEndPoint ip)
                         _deviceRegisters.TryAdd(ip.Address, new ushort[10]);
+                }
+
+                if (_work)
+                {
+                    _tasks.Add(Task.Run(()
+                        => ReadResponceLoop(stream, cancellationTokenSource.Token)));
                 }
             }
             catch (Exception)
