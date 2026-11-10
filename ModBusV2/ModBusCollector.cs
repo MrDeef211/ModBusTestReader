@@ -3,40 +3,144 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using Tcp = (System.Net.Sockets.TcpClient Client, System.Net.Sockets.NetworkStream Stream);
 
 namespace ModBusV2
 {
     public class ModBusCollector : IDisposable
     {
-        private CancellationTokenSource cancellationTokenSource;
+        // Глобальный токет отмены всех операций
+        private CancellationTokenSource _cancellationTokenSource = new();
+
+        // Событие получения ответа на команду
+        private ConcurrentDictionary<ushort, TaskCompletionSource> _commandResponseReceived = new();
+
+        // Событие получения ответа на запрос
+        private ConcurrentDictionary<ushort, TaskCompletionSource<ushort>> _requestResponseReceived = new();
 
         // Список активных клиентов + их стримы 
         private ConcurrentDictionary<TcpClient, NetworkStream> _clients = new();
 
-        // Кешированные данные регистров
-        private ConcurrentDictionary<IPAddress, ushort[]> _deviceRegisters = new();
+        // Кешированный список аддресс - стрим для удобства отправки
+        /// <summary>
+        /// ПОТОКОНЕБЕЗОПАСНО
+        /// </summary>
+        public Dictionary<IPAddress, NetworkStream> _streams = new();
+
+        // Кешированные локально данные регистров
+        private ConcurentArrayListOfArray<IPAddress, ushort> _deviceRegisters = new();
 
         // Актуальные для принятия транзакции
         private ConcurrentDictionary<ushort, bool> _activeTransactions = new();
 
         private List<Task> _tasks = new List<Task>();
 
+        // Данные для команды отправки команды записи
+        private WriteCommand _writeCommand = new();
+
+        // Данные для запроса данных первой ячейки
+        private ReadRequest _readRequest = new();
+
         // ID текущей транзакции
         private ushort _transactionID = 0;
+
+        // Id устройств в сети
+        const byte _deviceId = 1;
 
         // Флаг, работает ли сейчас опрос
         private bool _work = false;
 
-        public IReadOnlyDictionary<IPAddress, ushort[]> DeviceRegisters => _deviceRegisters;
+        public IReadOnlyDictionary<IPAddress, ushort[]> DeviceRegisters
+            => (Dictionary<IPAddress, ushort[]>)_deviceRegisters;
 
-        public IReadOnlyCollection<IPAddress> Devices
-            => (IReadOnlyCollection<IPAddress>)_deviceRegisters.Keys;
+        public IReadOnlyCollection<IPAddress> Devices => _deviceRegisters.Keys;
 
         public ModBusCollector()
         {
 
         }
+
+        #region Переменные для отправки команд записи
+
+        struct WriteCommand
+        {
+            private const byte _writeCommandLenght = 6;
+            private const byte _writeCommandId = 6;
+
+            private byte[] _writeCommandReqestData = new byte[_writeCommandLenght + 6];
+
+            public WriteCommand()
+            {
+                InitializeWriteCommand();
+            }
+
+            private void InitializeWriteCommand()
+            {
+                BinaryPrimitives.WriteUInt16BigEndian(
+                    _writeCommandReqestData.AsSpan(4, 2),
+                    _writeCommandLenght);
+
+                _writeCommandReqestData[6] = _deviceId;
+                _writeCommandReqestData[7] = _writeCommandId;
+
+            }
+
+            public byte[] Get(ushort transactionID, ushort register, ushort value)
+            {
+                Span<byte> buffer = _writeCommandReqestData.AsSpan();
+                BinaryPrimitives.WriteUInt16BigEndian(buffer.Slice(0, 2), transactionID);
+                BinaryPrimitives.WriteUInt16BigEndian(buffer.Slice(8, 2), register);
+                BinaryPrimitives.WriteUInt16BigEndian(buffer.Slice(10, 2), value);
+                return _writeCommandReqestData;
+            }
+        }
+
+        #endregion
+
+        #region Переменные для отправки запроса количества регистров
+
+        byte[] _readRequestbuffer = new byte[512];
+
+        int _readRequestBytesToRead = 0;
+
+        ushort _localTransactionId;
+
+        SemaphoreSlim _readRequestSemaphore = new SemaphoreSlim(1);
+
+        struct ReadRequest
+        {
+            const byte _readRequestLenght = 6;
+            const byte _readRequestId = 3;
+
+            byte[] _readReqestData = new byte[_readRequestLenght + 6];
+
+            public ReadRequest()
+            {
+                InitializeReadRequest();
+            }
+
+            public byte[] Get(ushort transactionID)
+            {
+                BinaryPrimitives.WriteUInt16BigEndian(
+                    _readReqestData.AsSpan(0, 2),
+                    transactionID);
+                return _readReqestData;
+            }
+
+            private void InitializeReadRequest()
+            {
+                BinaryPrimitives.WriteUInt16BigEndian(
+                    _readReqestData.AsSpan(4, 2),
+                    _readRequestLenght);
+                _readReqestData[6] = _deviceId;
+                _readReqestData[7] = _readRequestId;
+                BinaryPrimitives.WriteUInt16BigEndian(_readReqestData.AsSpan(8, 2), 0);
+                BinaryPrimitives.WriteUInt16BigEndian(_readReqestData.AsSpan(10, 2), 1);
+            }
+        }
+
+        #endregion
+
+        #region Старт, стоп
 
         public void Start()
         {
@@ -45,13 +149,11 @@ namespace ModBusV2
                 return;
             }
 
-            cancellationTokenSource = new CancellationTokenSource();
-
-            _tasks.Add(Task.Run(() => SendReadRequestLoop(cancellationTokenSource.Token)));
+            _tasks.Add(Task.Run(() => SendReadRequestLoop(_cancellationTokenSource.Token)));
             foreach (var device in _clients)
             {
                 _tasks.Add(Task.Run(()
-                    => ReadResponceLoop(device.Value, cancellationTokenSource.Token)));
+                    => ReadResponceLoop(device.Value, _cancellationTokenSource.Token)));
             }
             _work = true;
         }
@@ -63,17 +165,186 @@ namespace ModBusV2
                 return;
             }
 
-            cancellationTokenSource.Cancel();
-            cancellationTokenSource.Dispose();
+            _cancellationTokenSource.Cancel();
+            _cancellationTokenSource.Dispose();
             _work = false;
 
-            Task.WaitAll(_tasks);
+            try
+            {
+                Task.WaitAll(_tasks);
+            }
+            catch (Exception)
+            {
+
+            }
         }
 
-        public bool TrySendWriteRequest(CancellationToken cancellationToken = default)
+        #endregion
+
+        #region Ручные команды и запросы
+
+        /// <summary>
+        /// ПОТОКОНЕБЕЗОПАСНО отправляет команду об записи
+        /// </summary>
+        public async Task<bool> TrySendWriteCommand(
+            IPAddress iP,
+            ushort register,
+            ushort value,
+            CancellationToken cancellationToken = default)
         {
-            throw new NotImplementedException();
+            ushort transactionID = ++_transactionID;
+
+            TryUpdateStreamsDictionary();
+
+            if (!_streams.TryGetValue(iP, out var networkStream))
+            {
+                return false;
+            }
+
+            if (!_activeTransactions.TryAdd(transactionID, true))
+                return false;
+
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!_commandResponseReceived.TryAdd(transactionID, tcs))
+                return false;
+
+            try
+            {
+                await networkStream
+                    .WriteAsync(_writeCommand.Get(transactionID, register, value), cancellationToken)
+                    .ConfigureAwait(false);
+
+                await tcs.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+                _deviceRegisters.TrySetValue(iP, register, value);
+
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+            finally
+            {
+                _commandResponseReceived.TryRemove(transactionID, out _);
+            }
         }
+
+        /// <summary>
+        /// Получить длину регистра (полный цикл)
+        /// </summary>
+        private async Task<ushort> TryGetLengthRequest(
+            NetworkStream stream,
+            IPAddress address,
+            CancellationToken cancellationToken = default)
+        {
+            ushort transactionID = ++_transactionID;
+
+            try
+            {
+                await _readRequestSemaphore.WaitAsync(cancellationToken);
+
+                try
+                {
+                    await stream
+                        .WriteAsync(_readRequest.Get(transactionID), cancellationToken)
+                        .ConfigureAwait(false);
+
+                    do
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        _readRequestBytesToRead = await stream
+                            .ReadAsync(_readRequestbuffer, cancellationToken)
+                            .ConfigureAwait(false);
+
+                        _localTransactionId = BinaryPrimitives.ReadUInt16BigEndian(
+                            _readRequestbuffer
+                            .AsSpan(0, 2)
+                        );
+
+                    } while (transactionID != _localTransactionId);
+
+                    if (_readRequestbuffer[8] == 0x02)
+                        return BinaryPrimitives.ReadUInt16BigEndian(
+                            _readRequestbuffer.AsSpan(9, 2));
+                    else
+                        return 0;
+                }
+                catch (OperationCanceledException)
+                {
+                    return 0;
+                }
+                finally
+                {
+                    _readRequestSemaphore?.Release();
+                }
+
+            }
+            catch (OperationCanceledException)
+            {
+                return 0;
+            }
+            finally
+            {
+                _requestResponseReceived.TryRemove(transactionID, out _);
+            }
+        }
+
+        /// <summary>
+        /// Получить длину регистра (только запрос)
+        /// </summary>
+        private async Task<bool> TrySetActualLengthRequest(
+            NetworkStream stream,
+            IPAddress address,
+            CancellationToken cancellationToken = default)
+        {
+            ushort transactionID = ++_transactionID;
+
+            try
+            {
+                if (!_activeTransactions.TryAdd(transactionID, true))
+                    return false;
+
+                var tcs = new TaskCompletionSource<ushort>(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (!_requestResponseReceived.TryAdd(transactionID, tcs))
+                    return false;
+
+                await _readRequestSemaphore.WaitAsync(cancellationToken);
+                try
+                {
+                    await stream
+                        .WriteAsync(_readRequest.Get(transactionID), cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return false;
+                }
+                finally
+                {
+                    _readRequestSemaphore?.Release();
+                }
+
+                ushort length = await tcs.Task
+                    .WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+
+                return _deviceRegisters.TrySetLength(address, length);
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+            finally
+            {
+                _requestResponseReceived.TryRemove(transactionID, out _);
+            }
+        }
+
+        #endregion
+
+        #region Работа в цикле
 
         private async Task SendReadRequestLoop(CancellationToken cancellationToken = default)
         {
@@ -84,26 +355,39 @@ namespace ModBusV2
             byte command = 3;
             byte deviceId = 1;
 
+            IPAddress? ip;
             byte[] reqestData = new byte[lenght + 6];
+            Span<byte> reqestDataSpan = reqestData.AsSpan();
 
-            BinaryPrimitives.WriteUInt16BigEndian(reqestData.AsSpan(4, 2), lenght);
-            reqestData[6] = deviceId;
-            reqestData[7] = command;
-            BinaryPrimitives.WriteUInt16BigEndian(reqestData.AsSpan(8, 2), startIndex);
-            BinaryPrimitives.WriteUInt16BigEndian(reqestData.AsSpan(10, 2), indexCount);
+            Task cooldown;
+
+            BinaryPrimitives.WriteUInt16BigEndian(reqestDataSpan.Slice(4, 2), lenght);
+            reqestDataSpan[6] = deviceId;
+            reqestDataSpan[7] = command;
+            BinaryPrimitives.WriteUInt16BigEndian(reqestDataSpan.Slice(8, 2), startIndex);
 
             while (!cancellationToken.IsCancellationRequested)
             {
                 //Опрос не чаще чем раз в 3 секунды
-                var cooldown = Task.Delay(3000);
+                cooldown = Task.Delay(3000);
 
                 foreach (var client in _clients)
                 {
+                    // span не может пройти за await
+                    reqestDataSpan = reqestData.AsSpan();
+
                     if (cancellationToken.IsCancellationRequested)
                         break;
 
                     transactionID = ++_transactionID;
-                    BinaryPrimitives.WriteUInt16BigEndian(reqestData.AsSpan(0, 2), transactionID);
+                    BinaryPrimitives.WriteUInt16BigEndian(reqestDataSpan.Slice(0, 2), transactionID);
+
+                    ip = GetIp(client.Key);
+                    if (ip == null)
+                        return;
+
+                    indexCount = (ushort)_deviceRegisters.GetLength(GetIp(client.Key)!);
+                    BinaryPrimitives.WriteUInt16BigEndian(reqestDataSpan.Slice(10, 2), indexCount);
 
                     await client.Value.WriteAsync(
                         reqestData,
@@ -118,7 +402,7 @@ namespace ModBusV2
         }
 
         private async Task ReadResponceLoop(
-            NetworkStream stream, 
+            NetworkStream stream,
             CancellationToken cancellationToken = default)
         {
             EndPoint? endpoint = stream.Socket.RemoteEndPoint;
@@ -129,19 +413,21 @@ namespace ModBusV2
             else throw new NoIPExeption();
 
             byte[] buffer = new byte[512];
-            ushort[] registersArray;
+            // Сделал 256 с расчётом на то, что больше не будет
+            ushort[] registersArray = new ushort[256];
             using MemoryStream message = new();
 
-            Span<ushort> registers = new();
-            ReadOnlySpan<ushort> registersBigEndian = new();
-            ReadOnlySpan<byte> MBAP = new();
-            ReadOnlySpan<byte> PDU = new();
+            Span<ushort> registers;
+            ReadOnlySpan<ushort> registersBigEndian;
+            ReadOnlySpan<byte> MBAP;
+            ReadOnlySpan<byte> PDU;
 
             int bufferBytesRead = 0;
             ushort PDULength = 0;
             ushort pointer = 0;
             ushort bytesReaded = 0;
             ushort localTransactionID = 0;
+            ushort localRegisterLength = 0;
 
             bool fragmented = false;
 
@@ -149,9 +435,10 @@ namespace ModBusV2
             {
 
                 bufferBytesRead = await stream
-                    .ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                    .ReadAsync(buffer, cancellationToken)
                     .ConfigureAwait(false);
 
+                // старые span не работает после await
                 registers = new();
                 registersBigEndian = new();
                 MBAP = new();
@@ -165,8 +452,8 @@ namespace ModBusV2
 
                 pointer = 0;
 
-                while (pointer < bufferBytesRead 
-                    && bufferBytesRead > 0 
+                while (pointer < bufferBytesRead
+                    && bufferBytesRead > 0
                     && !cancellationToken.IsCancellationRequested)
                 {
 
@@ -174,6 +461,7 @@ namespace ModBusV2
                     if (bytesReaded < 7)
                     {
                         //Пытаюсь прочитать MBAP
+                        #region Кошмар и ужас
                         if (fragmented && pointer + (7 - bytesReaded) <= bufferBytesRead)
                         {
                             message.Write(buffer.AsSpan(pointer, (7 - bytesReaded)));
@@ -193,24 +481,28 @@ namespace ModBusV2
                             bytesReaded += (ushort)(bufferBytesRead - pointer);
                             break;
                         }
+                        #endregion
                     }
 
                     if (!fragmented)
-                        localTransactionID = BinaryPrimitives.ReadUInt16BigEndian(MBAP.Slice(0, 2));
+                    {
+                        localTransactionID = BinaryPrimitives.ReadUInt16BigEndian(
+                            MBAP
+                            .Slice(0, 2));
+                        //Считаю длину PDU (Length хранит длину Unit ID + PDU)
+                        PDULength = BinaryPrimitives.ReadUInt16BigEndian(MBAP.Slice(4, 2));
+                    }
                     else
+                    {
                         localTransactionID = BinaryPrimitives.ReadUInt16BigEndian(
                             message
                             .GetBuffer()
                             .AsSpan(0, 2));
-
-                    //Считаем длину PDU (Length хранит длину Unit ID + PDU)
-                    if (!fragmented)
-                        PDULength = BinaryPrimitives.ReadUInt16BigEndian(MBAP.Slice(4, 2));
-                    else
                         PDULength = BinaryPrimitives.ReadUInt16BigEndian(
                             message
                             .GetBuffer()
                             .AsSpan(4, 2));
+                    }
 
                     if (PDULength == 0)
                     {
@@ -218,9 +510,11 @@ namespace ModBusV2
                         continue;
                     }
 
+                    // Length хранит длину Unit ID + PDU
                     PDULength--;
 
                     //Пытаюсь прочитать PDU
+                    #region Кошмар и ужас
                     if (fragmented && pointer + (PDULength + 7 - bytesReaded) <= bufferBytesRead)
                     {
                         message.Write(buffer.AsSpan(pointer, (PDULength + 7 - bytesReaded)));
@@ -242,6 +536,7 @@ namespace ModBusV2
                         message.Write(buffer.AsSpan(pointer, bufferBytesRead - pointer));
                         break;
                     }
+                    #endregion
 
                     //Проверяю что мы этот запрос отправляли
                     if (!_activeTransactions.ContainsKey(localTransactionID)
@@ -257,29 +552,60 @@ namespace ModBusV2
 
                     switch (PDU[0])
                     {
-                        case 3:
-                            if (PDU[1] == PDU.Length - 2 
-                                && PDU[1] % 2 == 0 
-                                && PDU[1] <= 2 * _deviceRegisters[address].Length)
+                        case 0x03:
+                            localRegisterLength = (ushort)_deviceRegisters.GetLength(address);
+
+                            if (PDU[1] == PDU.Length - 2
+                                && PDU[1] % 2 == 0
+                                && PDU[1] <= 2 * localRegisterLength
+                                && PDU[1] > 4)
                             {
-                                registersArray = _deviceRegisters.GetOrAdd(
-                                    address,
-                                    static (_, size) => new ushort[size],
-                                    10
+                                //Использую существую переменную, чтобы не плодить новые переменные
+                                bytesReaded = BinaryPrimitives.ReadUInt16BigEndian(PDU.Slice(2, 2));
+
+                                if (localRegisterLength != bytesReaded)
+                                    _ = TrySetActualLengthRequest(stream, address, cancellationToken)
+                                    // Пока не придумал что делать в случае ошибки
+                                    .ContinueWith(t => { if (t.IsFaulted || !t.Result) ; }, TaskContinuationOptions.ExecuteSynchronously);
+
+                                registers = registersArray
+                                    .AsSpan(0, localRegisterLength);
+
+                                registersBigEndian = MemoryMarshal.Cast<byte, ushort>(
+                                    PDU.Slice(2)
                                 );
-                                registers = registersArray.AsSpan();
-                                registersBigEndian = MemoryMarshal.Cast<byte, ushort>(PDU.Slice(2));
+
                                 BinaryPrimitives.ReverseEndianness(registersBigEndian, registers);
+                                _deviceRegisters.TrySetArray(address, registers);
+                            }
+                            else if (PDU[1] == PDU.Length - 2
+                                && PDU[1] % 2 == 0
+                                && PDU[1] == 2)
+                            {
+                                //Использую существую переменную, чтобы не плодить новые переменные
+                                bytesReaded = BinaryPrimitives.ReadUInt16BigEndian(PDU.Slice(2, 2));
+                                _requestResponseReceived[localTransactionID].SetResult(bytesReaded);
                             }
                             Clear();
                             break;
-                        case >= 0x80:
+                        case 0x06:
+                            _commandResponseReceived[localTransactionID].SetResult();
+                            break;
+                        case 0x83:
+                            if (PDU[1] == 0x02)
+                            {
+                                _ = TrySetActualLengthRequest(stream, address, cancellationToken)
+                                    // Пока не придумал что делать в случае ошибки
+                                    .ContinueWith(t => { if (t.IsFaulted || !t.Result) ; }, 
+                                    TaskContinuationOptions.ExecuteSynchronously);
+                            }
                             Clear();
                             continue;
                         default:
                             Clear();
                             continue;
                     }
+                    Clear();
                 }
             }
 
@@ -292,9 +618,11 @@ namespace ModBusV2
             }
         }
 
+        #endregion
+
         #region Подключение 
 
-        private async Task SearchConnections(
+        public async Task SearchConnections(
             CancellationToken cancellationToken = default)
         {
             HashSet<IPAddress> existingAddress = new HashSet<IPAddress>();
@@ -330,7 +658,7 @@ namespace ModBusV2
             }
         }
 
-        private async Task TryConnect(
+        public async Task TryConnect(
             IPEndPoint Ip,
             CancellationToken cancellationToken = default)
         {
@@ -338,7 +666,7 @@ namespace ModBusV2
             try
             {
                 using CancellationTokenSource timeCts = new(
-                        TimeSpan.FromSeconds(1));
+                        TimeSpan.FromSeconds(2));
 
                 using CancellationTokenSource cts
                     = CancellationTokenSource.CreateLinkedTokenSource(
@@ -348,26 +676,29 @@ namespace ModBusV2
 
                 var stream = tcpClient.GetStream();
 
-                // Если не пришло исключение, значит всё ок
-                // TODO Нужно потом придумать нормальную индексацию
-                //ushort test = await ReadRegister(
-                //    stream,
-                //    Ip.Address.GetAddressBytes()[3],
-                //    0,
-                //    cancellationToken);
+                ushort length = await TryGetLengthRequest(
+                    stream,
+                    Ip.Address,
+                    cts.Token
+                );
+
+                if (length == 0)
+                {
+                    return;
+                }
 
                 if (tcpClient != null && tcpClient != null)
                 {
                     _clients.TryAdd(tcpClient, stream);
                     var endPoint = tcpClient.Client.RemoteEndPoint;
                     if (endPoint is IPEndPoint ip)
-                        _deviceRegisters.TryAdd(ip.Address, new ushort[10]);
+                        _deviceRegisters.TryAdd(ip.Address, new ushort[length]);
                 }
 
                 if (_work)
                 {
                     _tasks.Add(Task.Run(()
-                        => ReadResponceLoop(stream, cancellationTokenSource.Token)));
+                        => ReadResponceLoop(stream, _cancellationTokenSource.Token)));
                 }
             }
             catch (Exception)
@@ -377,6 +708,32 @@ namespace ModBusV2
         }
 
         #endregion
+
+        private void TryUpdateStreamsDictionary()
+        {
+            if (_streams.Count == _clients.Count)
+                return;
+
+            foreach (var client in _clients)
+            {
+                EndPoint? endpoint = client.Key.Client.RemoteEndPoint;
+
+                if (endpoint != null
+                    && endpoint is IPEndPoint ip
+                    && !_streams.ContainsKey(ip.Address))
+                {
+                    _streams.TryAdd(ip.Address, client.Value);
+                }
+            }
+        }
+
+        private IPAddress? GetIp(TcpClient client)
+        {
+            var endPoint = client.Client.RemoteEndPoint;
+            if (endPoint is IPEndPoint ip)
+                return ip.Address;
+            else return null;
+        }
 
         public void Dispose()
         {
@@ -392,7 +749,7 @@ namespace ModBusV2
             clients.Clear();
 
             var deviceRegisters = Interlocked.Exchange(ref _deviceRegisters!, null);
-            deviceRegisters.Clear();
+            deviceRegisters.Dispose();
 
             var activeTransactions = Interlocked.Exchange(ref _activeTransactions!, null);
             activeTransactions.Clear();
